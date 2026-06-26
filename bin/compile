@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir> <env-dir>
+
+set -eu -o pipefail
+
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+BUILDPACK_DIR=$(cd "$(dirname "$0")"; cd ..; pwd)
+
+BUILDPACK_NAME="apache-arrow"
+
+function topic() {
+  echo "-----> $*"
+}
+
+function indent() {
+  c='s/^/       /'
+  case $(uname) in
+    Darwin) sed -l "$c";;
+    *)      sed -u "$c";;
+  esac
+}
+
+source="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+destination_path="$BUILD_DIR/vendor/yt-dlp"
+destination="$destination_path/yt-dlp"
+
+WORKING_DIR="${CACHE_DIR}/${BUILDPACK_NAME}"
+STACK_VERSION_FILE="${WORKING_DIR}/STACK"
+if [[ -f "${STACK_VERSION_FILE}" ]]; then
+  CACHED_STACK=$(cat "${STACK_VERSION_FILE}")
+else
+  CACHED_STACK=
+fi
+
+# Ensure we store the STACK in the cache for next time.
+mkdir -p "${CACHE_DIR}/${BUILDPACK_NAME}"
+echo "${STACK}" > "${STACK_VERSION_FILE}"
+
+APT_CACHE_DIR="${WORKING_DIR}/apt/cache"
+APT_STATE_DIR="${WORKING_DIR}/apt/state"
+APT_SOURCELIST_DIR="${WORKING_DIR}/apt/sources"
+APT_SOURCEPARTS_DIR="${APT_SOURCELIST_DIR}/sources.list.d"
+APT_SOURCES="${APT_SOURCELIST_DIR}/sources.list"
+
+APT_VERSION=$(apt-get -v | awk 'NR == 1{ print $2 }')
+case "$APT_VERSION" in
+  0* | 1.0*) APT_FORCE_YES=("--force-yes");;
+  *)         APT_FORCE_YES=("--allow-downgrades" "--allow-remove-essential" "--allow-change-held-packages");;
+esac
+
+if [[ "$CACHED_STACK" == "$STACK" ]] ; then
+  # STACK has not changed
+  topic "Reusing cache"
+else
+  # STACK changed
+  topic "Detected Stack changes; flushing cache"
+  rm -rf "${WORKING_DIR}"
+  mkdir -p "$APT_CACHE_DIR/archives/partial"
+  mkdir -p "$APT_STATE_DIR/lists/partial"
+  mkdir -p "$APT_SOURCELIST_DIR"   # make dir for sources
+  cat "/etc/apt/sources.list" > "$APT_SOURCES"    # no cp here
+  cp -R "/etc/apt/sources.list.d" "$APT_SOURCEPARTS_DIR"
+fi
+
+APT_OPTIONS=("-o" "debug::nolocking=true" "-o" "dir::cache=$APT_CACHE_DIR" "-o" "dir::state=$APT_STATE_DIR")
+# Override the use of /etc/apt/sources.list (sourcelist) and /etc/apt/sources.list.d/* (sourceparts).
+APT_OPTIONS+=("-o" "dir::etc::sourcelist=$APT_SOURCES" "-o" "dir::etc::sourceparts=$APT_SOURCEPARTS_DIR")
+
+topic "Updating APT package index (1/2)"
+apt-get "${APT_OPTIONS[@]}" update 2>&1 | indent
+
+topic "Installing source repo package"
+DISTRO_CODENAME=$(lsb_release --codename --short)
+REPO_PACKAGE="apache-arrow-apt-source-latest-${DISTRO_CODENAME}.deb"
+apt-get "${APT_OPTIONS[@]}" -y "${APT_FORCE_YES[@]}" install ca-certificates lsb-release wget | indent
+wget -P "${WORKING_DIR}" https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/${REPO_PACKAGE}
+apt-get "${APT_OPTIONS[@]}" -y "${APT_FORCE_YES[@]}" install --reinstall "${WORKING_DIR}/${REPO_PACKAGE}" | indent
+
+topic "Updating APT package index (2/2)"
+apt-get "${APT_OPTIONS[@]}" update 2>&1 | indent
+
+topic "Fetching .debs for Arrow"
+apt-get "${APT_OPTIONS[@]}" -y "${APT_FORCE_YES[@]}" -d install --reinstall libarrow-dev libarrow-glib-dev | indent
+
+BUILD_TARGET_DIR="$BUILD_DIR/.${BUILDPACK_NAME}"
+mkdir -p "${BUILD_TARGET_DIR}"
+
+for DEB in "$APT_CACHE_DIR/archives/"*.deb; do
+  topic "Installing $(basename "$DEB")"
+  dpkg -x "$DEB" "${BUILD_TARGET_DIR}/"
+done
+
+topic "Writing profile script"
+mkdir -p "$BUILD_DIR/.profile.d"
+RUNTIME_PROFILE_SCRIPT="$BUILD_DIR/.profile.d/${BUILDPACK_NAME}.sh"
+cat <<EOF >"$RUNTIME_PROFILE_SCRIPT"
+export PATH="\$HOME/.${BUILDPACK_NAME}/usr/bin:\$PATH"
+export LD_LIBRARY_PATH="\$HOME/.${BUILDPACK_NAME}/usr/lib/x86_64-linux-gnu:\$HOME/.${BUILDPACK_NAME}/usr/lib/i386-linux-gnu:\$HOME/.${BUILDPACK_NAME}/usr/lib:\$LD_LIBRARY_PATH"
+export LIBRARY_PATH="\$HOME/.${BUILDPACK_NAME}/usr/lib/x86_64-linux-gnu:\$HOME/.${BUILDPACK_NAME}/usr/lib/i386-linux-gnu:\$HOME/.${BUILDPACK_NAME}/usr/lib:\$LIBRARY_PATH"
+export INCLUDE_PATH="\$HOME/.${BUILDPACK_NAME}/usr/include:\$HOME/.${BUILDPACK_NAME}/usr/include/x86_64-linux-gnu:\$INCLUDE_PATH"
+export CPATH="\$INCLUDE_PATH"
+export CPPPATH="\$INCLUDE_PATH"
+export PKG_CONFIG_PATH="\$HOME/.${BUILDPACK_NAME}/usr/lib/x86_64-linux-gnu/pkgconfig:\$HOME/.${BUILDPACK_NAME}/usr/lib/i386-linux-gnu/pkgconfig:\$HOME/.${BUILDPACK_NAME}/usr/lib/pkgconfig:\$PKG_CONFIG_PATH"
+EOF
+
+export PATH="${BUILD_TARGET_DIR}/usr/bin:$PATH"
+export LD_LIBRARY_PATH="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu:${BUILD_TARGET_DIR}/usr/lib/i386-linux-gnu:${BUILD_TARGET_DIR}/usr/lib:$LD_LIBRARY_PATH"
+export LIBRARY_PATH="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu:${BUILD_TARGET_DIR}/usr/lib/i386-linux-gnu:${BUILD_TARGET_DIR}/usr/lib:$LIBRARY_PATH"
+export INCLUDE_PATH="${BUILD_TARGET_DIR}/usr/include:${BUILD_TARGET_DIR}/usr/include/x86_64-linux-gnu:$INCLUDE_PATH"
+export CPATH="$INCLUDE_PATH"
+export CPPPATH="$INCLUDE_PATH"
+export PKG_CONFIG_PATH="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu/pkgconfig:${BUILD_TARGET_DIR}/usr/lib/i386-linux-gnu/pkgconfig:${BUILD_TARGET_DIR}/usr/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+topic "Exporting environment"
+BUILDPACK_EXPORT_FILE="$BUILDPACK_DIR/export"
+export | grep -E -e ' (PATH|LD_LIBRARY_PATH|LIBRARY_PATH|INCLUDE_PATH|CPATH|CPPPATH|PKG_CONFIG_PATH)=' > "$BUILDPACK_EXPORT_FILE"
+
+topic "Rewrite package-config files"
+find "$BUILD_TARGET_DIR" -type f -ipath '*/pkgconfig/*.pc' -print0 | xargs -0 --no-run-if-empty -n 1 sed -i -e 's!^prefix=\(.*\)$!prefix='"$BUILD_DIR"'/.'"${BUILDPACK_NAME}"'\1!g'
+
+topic "Installation complete!"
