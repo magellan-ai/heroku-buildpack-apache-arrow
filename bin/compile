@@ -3,6 +3,8 @@
 
 set -eu -o pipefail
 
+# Thanks to the developers of https://github.com/heroku/heroku-buildpack-apt
+
 BUILD_DIR="$1"
 CACHE_DIR="$2"
 BUILDPACK_DIR=$(cd "$(dirname "$0")"; cd ..; pwd)
@@ -67,17 +69,25 @@ APT_OPTIONS=("-o" "debug::nolocking=true" "-o" "dir::cache=$APT_CACHE_DIR" "-o" 
 # Override the use of /etc/apt/sources.list (sourcelist) and /etc/apt/sources.list.d/* (sourceparts).
 APT_OPTIONS+=("-o" "dir::etc::sourcelist=$APT_SOURCES" "-o" "dir::etc::sourceparts=$APT_SOURCEPARTS_DIR")
 
-topic "Updating APT package index (1/2)"
-apt-get "${APT_OPTIONS[@]}" update 2>&1 | indent
+topic "Fetching source repo package"
+REPO_PACKAGE="apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb"
+wget -q -P "${WORKING_DIR}" https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/${REPO_PACKAGE} | indent
 
-topic "Installing source repo package"
-DISTRO_CODENAME=$(lsb_release --codename --short)
-REPO_PACKAGE="apache-arrow-apt-source-latest-${DISTRO_CODENAME}.deb"
-apt-get "${APT_OPTIONS[@]}" -y "${APT_FORCE_YES[@]}" install ca-certificates lsb-release wget | indent
-wget -P "${WORKING_DIR}" https://packages.apache.org/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/${REPO_PACKAGE}
-apt-get "${APT_OPTIONS[@]}" -y "${APT_FORCE_YES[@]}" install --reinstall "${WORKING_DIR}/${REPO_PACKAGE}" | indent
+topic "Installing source repo definition"
+REPO_EXTRACT_DIR="${WORKING_DIR}/apt-source"
+rm -rf "${REPO_EXTRACT_DIR}"
+mkdir -p "${REPO_EXTRACT_DIR}"
+dpkg -x "${WORKING_DIR}/${REPO_PACKAGE}" "${REPO_EXTRACT_DIR}"
 
-topic "Updating APT package index (2/2)"
+KEYRING_DIR="${APT_SOURCELIST_DIR}/keyrings"
+mkdir -p "${KEYRING_DIR}"
+cp "${REPO_EXTRACT_DIR}"/usr/share/keyrings/* "${KEYRING_DIR}/"
+
+for SRC_DEF in "${REPO_EXTRACT_DIR}"/etc/apt/sources.list.d/*; do
+  sed "s#/usr/share/keyrings#${KEYRING_DIR}#g" "${SRC_DEF}" > "${APT_SOURCEPARTS_DIR}/$(basename "${SRC_DEF}")"
+done
+
+topic "Updating APT package index"
 apt-get "${APT_OPTIONS[@]}" update 2>&1 | indent
 
 topic "Fetching .debs for Arrow"
