@@ -95,22 +95,18 @@ done
 topic "Updating APT package index"
 apt-get "${APT_OPTIONS[@]}" update 2>&1 | indent
 
-topic "Resolving girepository runtime dependency"
-# libarrow-glib-dev depends on girepository, whose runtime library (libgirepository-1.0.so.1)
-# is pre-installed in Heroku's build image but not the run image. Derive the exact package name
-# from the dependency closure so a future girepository ABI bump is tracked automatically.
-GIREPOSITORY_RUNTIME_PACKAGE=$(apt-cache "${APT_OPTIONS[@]}" depends --recurse \
-  --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces --no-enhances \
-  libarrow-glib-dev | grep -oE 'libgirepository-[0-9.]+-[0-9]+' | sort -u | head -n 1) || true
-
-if [[ -z "${GIREPOSITORY_RUNTIME_PACKAGE}" ]]; then
-  error "Could not resolve girepository runtime package from libarrow-glib-dev deps"
-fi
-topic "Resolved girepository runtime package: ${GIREPOSITORY_RUNTIME_PACKAGE}"
-
 topic "Fetching .debs for Arrow"
+# The Ruby gobject-introspection gem (which red-arrow rides on) is compiled against the
+# legacy girepository 1.0 ABI, so its extension loads libgirepository-1.0.so.1 at runtime.
+# That library ships in Heroku's build image but not its run image, so apt treats it as
+# already-installed and skips it; name it explicitly to force it into the slug.
+#
+# This requirement comes from the gem, NOT from libarrow-glib: libarrow-glib uses the newer
+# girepository 2.0 (libgirepository-2.0-0), so deriving the package from libarrow-glib-dev's
+# dependency closure resolves to 2.0 and produces a slug the gem still can't load. The
+# post-extraction assertion below verifies the 1.0 .so actually landed in the slug.
 apt-get "${APT_OPTIONS[@]}" -y "${APT_FORCE_YES[@]}" -d install --reinstall \
-  libarrow-dev libarrow-glib-dev "${GIREPOSITORY_RUNTIME_PACKAGE}" | indent
+  libarrow-dev libarrow-glib-dev libgirepository-1.0-1 | indent
 
 BUILD_TARGET_DIR="$BUILD_DIR/.${BUILDPACK_NAME}"
 mkdir -p "${BUILD_TARGET_DIR}"
@@ -119,6 +115,13 @@ for DEB in "$APT_CACHE_DIR/archives/"*.deb; do
   topic "Installing $(basename "$DEB")"
   dpkg -x "$DEB" "${BUILD_TARGET_DIR}/"
 done
+
+# Fail loudly at build time if the library the gobject-introspection gem links against did
+# not make it into the slug, rather than discovering it as a LoadError in production.
+GIREPOSITORY_RUNTIME_LIB="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu/libgirepository-1.0.so.1"
+if [[ ! -e "${GIREPOSITORY_RUNTIME_LIB}" ]]; then
+  error "Missing ${GIREPOSITORY_RUNTIME_LIB} in the slug — the gobject-introspection gem will fail to load 'arrow' at runtime. Confirm libgirepository-1.0-1 still provides libgirepository-1.0.so.1 on this stack."
+fi
 
 topic "Writing profile script"
 mkdir -p "$BUILD_DIR/.profile.d"
@@ -141,7 +144,7 @@ export INCLUDE_PATH="${BUILD_TARGET_DIR}/usr/include:${BUILD_TARGET_DIR}/usr/inc
 export CPATH="$INCLUDE_PATH"
 export CPPPATH="$INCLUDE_PATH"
 export PKG_CONFIG_PATH="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu/pkgconfig:${BUILD_TARGET_DIR}/usr/lib/i386-linux-gnu/pkgconfig:${BUILD_TARGET_DIR}/usr/lib/pkgconfig:$PKG_CONFIG_PATH"
-export GI_TYPELIB_PATH="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu/girepository-1.0:${BUILD_TARGET_DIR}/usr/lib/girepository-1.0:$GI_TYPELIB_PATH"
+export GI_TYPELIB_PATH="${BUILD_TARGET_DIR}/usr/lib/x86_64-linux-gnu/girepository-1.0:${BUILD_TARGET_DIR}/usr/lib/girepository-1.0:${GI_TYPELIB_PATH:-}"
 
 topic "Exporting environment"
 BUILDPACK_EXPORT_FILE="$BUILDPACK_DIR/export"
